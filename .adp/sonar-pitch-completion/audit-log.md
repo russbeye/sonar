@@ -353,3 +353,13 @@ The Test Adversary Document lists 9 gaps. Reviewers need to know these four firs
 - The suite forces a UTF-8 locale, so it cannot catch a tmux server that starts without one.
 - Timing runs in prompt mode only.
 - The danger, remote, CI, toolchain, and agents segments and the `claude` mode have no checks, because this task did not change their logic.
+
+### [DL-020] Publish the repo in public with its audit log and author email
+- **Decision:** The repo is public at https://github.com/russbeye/sonar on branch `master`. It includes `.adp/`, and its commits keep the author email that they already carry.
+- **Alternatives considered:** Remove `.adp/` from history before the push. Rewrite the commits to the GitHub noreply address.
+- **Rationale:** The developer chose both options on 2026-11-22, after a question that named what the audit log exposes: the home path, other local project names, process command lines, and the pitch artifact link. The question also said that the commits carry a personal email. A scan for tokens and private keys found nothing before the push.
+- **Confidence:** HIGH
+- **Confidence basis:** DEVELOPER ASSERTION — the developer's answers to the publish question. DIRECT EVIDENCE — `gh repo view` reports the visibility as PUBLIC.
+- **Assumptions:** none
+- **Created:** 2026-11-22, Phase 7
+- **Status:** VALIDATED
