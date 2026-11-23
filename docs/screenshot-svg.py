@@ -10,7 +10,13 @@ OUT_DIR, SVG = sys.argv[1], sys.argv[2]
 CW, LH, FS = 8.4, 22, 14          # cell width, line height, font size in px
 PAD, GAP, TITLE = 18, 34, 30      # frame padding, gap between frames, title bar height
 BG, BAR, FG, DIM = "#1a1b26", "#16161e", "#c0caf5", "#565f89"
-FONT = "'JetBrains Mono','JetBrainsMono Nerd Font','DejaVu Sans Mono',Menlo,Consolas,monospace"
+# Browsers draw these as color emoji unless we ask for the text form.
+TEXT_FORM = set("⚙⚠")
+WIDE = set("⚙⚠⎇⧉")
+# Symbol fonts follow the monospace ones so that glyphs such as ⚙ use a text font
+# from Linux, macOS, or Windows before the browser falls back to color emoji.
+FONT = ("'JetBrains Mono','JetBrainsMono Nerd Font','DejaVu Sans Mono',Menlo,Consolas,"
+        "'Noto Sans Symbols','Apple Symbols','Segoe UI Symbol','DejaVu Sans',monospace")
 
 # name, label, columns, history lines as (color, text) runs per line
 PANELS = [
@@ -60,9 +66,24 @@ def runs(cells):
     return out
 
 def text(x0, y, start, s, fill, bold=False):
-    xs = " ".join(f"{x0 + (start + k) * CW:.1f}" for k in range(len(s)))
+    # Browsers collapse spaces inside SVG text even with xml:space="preserve", and
+    # that shifts every later character left by one cell. So we never emit a
+    # space. Each ASCII word and each symbol becomes its own element, pinned to its cells.
     w = ' font-weight="700"' if bold else ""
-    return f'<text x="{xs}" y="{y}" fill="{fill}"{w}>{html.escape(s)}</text>'
+    out = []
+    for m in re.finditer(r"[!-~]+|\S", s):
+        tok, col = m.group(), start + m.start()
+        if tok.isascii():
+            xs = " ".join(f"{x0 + (col + k) * CW:.1f}" for k in range(len(tok)))
+            out.append(f'<text x="{xs}" y="{y}" fill="{fill}"{w}>{html.escape(tok)}</text>')
+            continue
+        # A symbol can come from a proportional fallback font and be wider than a
+        # cell. We center each symbol in its cell, and squeeze the wide ones to fit.
+        fit = f' textLength="{CW * 0.95:.1f}" lengthAdjust="spacingAndGlyphs"' if tok in WIDE else ""
+        sel = "\ufe0e" if tok in TEXT_FORM else ""
+        out.append(f'<text x="{x0 + (col + 0.5) * CW:.1f}" y="{y}" fill="{fill}" text-anchor="middle"{w}{fit}>'
+                   f'{html.escape(tok)}{sel}</text>')
+    return "".join(out)
 
 width = max(cols for *_, cols, _ in PANELS) * CW + 2 * PAD + 2
 parts, y = [], 0
