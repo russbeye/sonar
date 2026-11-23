@@ -1,10 +1,15 @@
 # sonar
 
-![Sonar's status line in four states: calm, in flow, trouble, and a worktree in a narrow split](docs/sonar.svg)
+![Sonar in flow: three modified files for 47 minutes, two commits not pushed, CI running, an agent waiting, and two dev servers up](docs/flow.png)
+
+![Sonar in trouble: a prod kube context, a failed command, four commits behind, CI red, and the wrong Node version](docs/trouble.png)
 
 Sonar is a status line for bash, tmux, and Claude Code. It shows the state of the work in the current pane: what you haven't committed, what is running, what broke, and whether your shell points at production.
 
-Most segments stay hidden until they have something to report. In a clean repo with nothing running, the bar shows the repo name, the branch, and a green CI check. When the bar gets longer, something needs your attention. The render path only reads cached files, so a slow `gh` call or port scan never holds up your prompt.
+Most segments stay hidden until they have something to report. In a clean repo with nothing running, the bar shows the repo name, the branch, and a green CI check. When the bar gets longer, something needs your attention.
+
+![Sonar in a clean repo: the repo name, the branch, and a green CI check](docs/calm.png)
+ The render path only reads cached files, so a slow `gh` call or port scan never holds up your prompt.
 
 ## Reading the bar
 
@@ -26,6 +31,8 @@ The left side shows where you are and the state of the tree. The right side show
 | Jobs | `⚙1` | The shell has background jobs. |
 
 When the pane gets narrow, segments shorten before any of them disappear. The branch loses its middle (`feat/crc-calib…wins-baseline`), then keeps only its type and ticket number (`fix/017…`) or its last word. The path drops its middle folders, the drift dial drops its time, and the agents count becomes `✦2`. If the bar still doesn't fit, Sonar drops segments in this order: the drift dial first, then ports and jobs, then CI, toolchain, and agents. Danger, remote host, path, branch, and the last command always stay.
+
+![Sonar in a 72-column split, inside a worktree named after its long branch](docs/worktree-72.png)
 
 The ports segment skips ports in the kernel's ephemeral range (32768 to 60999 on most Linux systems), because those change every time a server restarts. To show one of those ports, or to give a port a name, add a `.sonar` file to the repo root with one `name=port` per line:
 
