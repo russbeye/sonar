@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# Sonar: a status line that stays short until something needs you.
+#
+#   sonar tmux <pane_id> <pane_path> <width>   tmux status-format line
+#   sonar prompt <key> <dir> <width>           ANSI line above the bash prompt
+#   sonar claude                               Claude Code statusLine (JSON on stdin)
+#   sonar refresh <dir>                        background CI and port lookups
+#   sonar agent wait|clear                     Claude Code hook (JSON on stdin)
+#
+# The render path only reads files. Anything slow (gh, ss) runs in `refresh`,
+# which the render path starts in the background at most once per TTL, so a
+# slow network call can never stall the bar.
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/sonar"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/sonar"
+CI_TTL=60
+PORT_TTL=15
+mkdir -p "$CACHE" "$STATE/pane" "$STATE/agents" 2>/dev/null
+
+# Sonar runs at every prompt, so the hot path avoids forks. The loadable stat
+# builtin reads an mtime without starting a process.
+enable -f /usr/lib/bash/stat stat 2>/dev/null
+
+mtime_age() { # seconds since file $1 changed, or a large number if it is missing
+  local -A st
+  stat -A st "$1" 2>/dev/null || { echo 999999; return; }
+  echo $(( EPOCHSECONDS - st[mtime] ))
+}
+
+# A cache file name for a path. Swapping / for % keeps it unique without hashing.
+key_for() { echo "${1//\//%}"; }
+
+# ---------- background refresh ----------
+
+refresh() {
+  local dir=$1 key root branch
+  root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return
+  key=${ key_for "$root"; }
+
+  branch=$(git -C "$root" symbolic-ref --short -q HEAD)
+  if [[ -n $branch ]] && command -v gh >/dev/null; then
+    local out
+    # An empty result means there is no run for this branch, so we show nothing.
+    out=$(cd "$root" && timeout 10 gh run list -b "$branch" -L 1 \
+            --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null)
+    printf '%s\n' "$out" > "$CACHE/$key.ci"
+  fi
+
+  # A port belongs to this repo when the listening process runs inside it.
+  local ports=() line pid port cwd
+  while read -r line; do
+    port=${line%% *}; pid=${line#* }
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    [[ $cwd == "$root" || $cwd == "$root"/* ]] && ports+=(":$port")
+  done < <(ss -Hltnp 2>/dev/null | sed -nE 's/^\S+\s+\S+\s+\S+\s+\S*:([0-9]+)\s.*pid=([0-9]+).*/\1 \2/p' | sort -un)
+  printf '%s\n' "${ports[*]}" > "$CACHE/$key.ports"
+}
+
+maybe_refresh() { # $1 dir, $2 cache key
+  local lock="$CACHE/$2.lock"
+  if (( ${ mtime_age "$CACHE/$2.ci"; } > CI_TTL || ${ mtime_age "$CACHE/$2.ports"; } > PORT_TTL )) \
+     && (( ${ mtime_age "$lock"; } > CI_TTL )); then
+    : > "$lock"
+    ( refresh "$1" >/dev/null 2>&1 & )
+  fi
+}
+
+# ---------- segment collection ----------
+# Each segment is "side<TAB>priority<TAB>width<TAB>styled text". Priority 1 is
+# never dropped. Higher numbers drop first when the line is too wide.
+
+SEGS=()
+add() { SEGS+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"); }
+
+# Style helpers. tmux uses #[...] markup, Claude Code uses ANSI escapes.
+# Colors are the Tokyo Night values from the Sonar pitch.
+style() { # $1 name, $2 text
+  local c
+  case $1 in
+    dim) c='#565f89' ;; blue) c='#7aa2f7' ;; cyan) c='#7dcfff' ;; green) c='#9ece6a' ;;
+    amber) c='#e0af68' ;; red) c='#f7768e' ;; violet) c='#bb9af7' ;; orange) c='#ff9e64' ;;
+  esac
+  if [[ $MODE == tmux ]]; then
+    case $1 in
+      bold) printf '#[bold]%s#[nobold]' "$2" ;;
+      danger) printf '#[bg=#f7768e,fg=#16161e,bold] %s #[bg=#16161e,fg=#c0caf5,nobold]' "$2" ;;
+      *) printf '#[fg=%s]%s#[fg=#c0caf5]' "$c" "$2" ;;
+    esac
+  else
+    case $1 in
+      bold) printf '\e[1m%s\e[22m' "$2" ;;
+      danger) printf '\e[48;2;247;118;142m\e[38;2;22;22;30m\e[1m %s \e[0m' "$2" ;;
+      *) printf '\e[38;2;%d;%d;%dm%s\e[39m' "0x${c:1:2}" "0x${c:3:2}" "0x${c:5:2}" "$2" ;;
+    esac
+  fi
+}
+
+seg_danger() { # $1 AWS profile
+  local ctx="" cfg=${KUBECONFIG:-$HOME/.kube/config}
+  [[ -r ${cfg%%:*} ]] && ctx=$(sed -n 's/^current-context:[[:space:]]*//p' "${cfg%%:*}" | tr -d '"')
+  local hit=""
+  [[ $ctx == *prod* ]] && hit=$ctx
+  [[ -z $hit && $1 == *prod* ]] && hit=$1
+  [[ -n $hit ]] && add l 1 $(( ${#hit} + 4 )) "${ style danger "⚠ $hit"; }"
+}
+
+seg_remote() { # $1 SSH_CONNECTION, $2 host
+  [[ -n $1 ]] && add l 1 $(( ${#2} + 2 )) "${ style violet "⇄ $2"; }"
+}
+
+seg_path() { # $1 dir, $2 repo root or empty
+  local d=$1 home=$HOME rel parent leaf out=""
+  [[ $d == "$home" || $d == "$home"/* ]] && d="~${d#"$home"}"
+  leaf=${d##*/}; parent=${d%/*}
+  [[ $d == "~" || $d == / ]] && { leaf=$d; parent=""; }
+  # Shorten each parent component to its first character.
+  local IFS=/ part
+  for part in $parent; do
+    [[ -z $part ]] && continue
+    # Keep the dot of a hidden directory, so .config reads as .c and not as a bare dot.
+    [[ $part == .* ]] && out+="${part:0:2}/" || out+="${part:0:1}/"
+  done
+  [[ $parent == /* ]] && out="/$out"
+  [[ -z $parent && $d == /* && $d != / ]] && out="/"
+  local w=$(( ${#out} + ${#leaf} ))
+  if [[ -n $2 && $1 == "$2" ]]; then
+    add l 1 "$w" "${ style dim "$out"; }${ style blue "${ style bold "$leaf"; }"; }"
+  else
+    add l 1 "$w" "${ style dim "$out"; }${ style blue "$leaf"; }"
+  fi
+}
+
+seg_git() { # $1 dir; sets GIT_DIRTY and GIT_ROOT
+  local line branch="" ahead=0 behind=0 staged=0 modified=0 untracked=0 conflicted=0
+  GIT_DIRTY=0
+  while IFS= read -r line; do
+    case $line in
+      '# branch.head '*) branch=${line#\# branch.head } ;;
+      '# branch.oid '*) oid=${line#\# branch.oid } ;;
+      '# branch.ab '*) read -r _ _ ahead behind <<<"$line"; ahead=${ahead#+}; behind=${behind#-} ;;
+      '1 '*|'2 '*)
+        [[ ${line:2:1} != . ]] && ((staged++))
+        [[ ${line:3:1} != . ]] && ((modified++)) ;;
+      'u '*) ((conflicted++)) ;;
+      '? '*) ((untracked++)) ;;
+    esac
+  done < <(git -C "$1" status --porcelain=v2 -b 2>/dev/null)
+  [[ $branch == "(detached)" ]] && branch=${oid:0:7}
+  (( staged + modified + untracked + conflicted )) && GIT_DIRTY=1
+
+  local txt w
+  txt=${ style cyan "⎇ $branch"; }; w=$(( ${#branch} + 2 ))
+  (( ahead ))      && { txt+=" ${ style green "⇡$ahead"; }";       w=$(( w + 2 + ${#ahead} )); }
+  (( behind ))     && { txt+=" ${ style red "⇣$behind"; }";        w=$(( w + 2 + ${#behind} )); }
+  (( conflicted )) && { txt+=" ${ style red "!$conflicted"; }";    w=$(( w + 2 + ${#conflicted} )); }
+  (( staged ))     && { txt+=" ${ style green "+$staged"; }";      w=$(( w + 2 + ${#staged} )); }
+  (( modified ))   && { txt+=" ${ style amber "●$modified"; }";    w=$(( w + 2 + ${#modified} )); }
+  (( untracked ))  && { txt+=" ${ style dim "?$untracked"; }";     w=$(( w + 2 + ${#untracked} )); }
+  add l 1 "$w" "$txt"
+}
+
+seg_drift() { # $1 repo root. Only shown while the tree is dirty.
+  (( GIT_DIRTY )) || return
+  local ct age mins glyph col txt
+  ct=$(git -C "$1" log -1 --format=%ct 2>/dev/null) || return
+  [[ -n $ct ]] || return
+  age=$(( EPOCHSECONDS - ct )); mins=$(( age / 60 ))
+  if   (( mins < 30 ));  then glyph=◔
+  elif (( mins < 60 ));  then glyph=◑
+  elif (( mins < 180 )); then glyph=◕
+  else glyph=●; fi
+  (( mins >= 90 )) && col=amber || col=dim
+  if (( mins < 60 )); then txt="${mins}m"
+  elif (( mins < 1440 )); then printf -v txt '%dh%02d' $(( mins / 60 )) $(( mins % 60 ))
+  else txt="$(( mins / 1440 ))d"; fi
+  add l 4 $(( ${#txt} + 2 )) "${ style "$col" "$glyph $txt"; }"
+}
+
+seg_last() { # $1 exit status, $2 duration in ms
+  local st=$1 ms=${2:-0} dur="" txt
+  [[ -z $st ]] && return
+  (( ms >= 5000 )) && printf -v dur '%d.%ds' $(( ms / 1000 )) $(( ms % 1000 / 100 ))
+  if (( st != 0 )); then
+    txt="✗ $st${dur:+ · $dur}"
+    add r 1 "${#txt}" "${ style red "$txt"; }"
+  elif [[ -n $dur ]]; then
+    txt="✓ $dur"
+    add r 1 "${#txt}" "${ style dim "$txt"; }"
+  fi
+}
+
+seg_ci() { # $1 cache key
+  local status conclusion
+  [[ -r $CACHE/$1.ci ]] || return
+  read -r status conclusion < "$CACHE/$1.ci"
+  [[ -z $status ]] && return
+  if [[ $status != completed ]]; then add r 2 4 "${ style amber "ci ◌"; }"
+  elif [[ $conclusion == success ]]; then add r 2 4 "${ style green "ci ✓"; }"
+  elif [[ $conclusion == skipped || $conclusion == cancelled ]]; then return
+  else add r 2 4 "${ style red "ci ✗"; }"; fi
+}
+
+seg_toolchain() { # $1 repo root, $2 PATH to resolve node against
+  local want="" have="" f node
+  for f in "$1/.tool-versions" "$1/mise.toml" "$1/.mise.toml" "$1/.nvmrc" "$1/.node-version"; do
+    [[ -r $f ]] || continue
+    case ${f##*/} in
+      .tool-versions) want=$(sed -nE 's/^nodejs?[[:space:]]+([^[:space:]]+).*/\1/p' "$f") ;;
+      mise.toml|.mise.toml) want=$(sed -nE 's/^node[[:space:]]*=[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f") ;;
+      *) want=$(head -1 "$f") ;;
+    esac
+    [[ -n $want ]] && break
+  done
+  want=${want#v}
+  [[ $want =~ ^[0-9] ]] || return   # "lts/*", "latest" and similar aliases are not pinned
+  node=${ PATH=$2 command -v node; } || return
+  # mise installs carry the version in the path. Anything else we ask once and cache.
+  if [[ $(readlink -f "$node") =~ /installs/node/([0-9][^/]*)/ ]]; then
+    have=${BASH_REMATCH[1]}
+  else
+    local c="$CACHE/node-$(key_for "$(readlink -f "$node")")"
+    [[ -s $c ]] || { "$node" --version 2>/dev/null | tr -d v > "$c"; }
+    have=$(<"$c")
+  fi
+  [[ -z $have ]] && return
+  # Compare only as many components as the pin gives: "20" matches 20.11.1.
+  local n=${want//[^.]/}; n=$(( ${#n} + 1 ))
+  local have_cut; have_cut=$(cut -d. -f1-"$n" <<<"$have")
+  if [[ $have_cut != "$want" ]]; then
+    local txt="node ${have%%.*}≠${want%%.*}"
+    [[ ${have%%.*} == "${want%%.*}" ]] && txt="node $have≠$want"
+    add r 2 "${#txt}" "${ style orange "$txt"; }"
+  fi
+}
+
+seg_agents() {
+  local n=0 f
+  for f in "$STATE/agents"/*; do
+    [[ -e $f ]] || continue
+    # A session that crashed without clearing its file stops counting after 12 hours.
+    (( ${ mtime_age "$f"; } < 43200 )) && ((n++))
+  done
+  (( n )) && add r 2 $(( ${#n} + 10 )) "${ style violet "✦ $n waiting"; }"
+}
+
+seg_ports() { # $1 cache key
+  local p
+  [[ -r $CACHE/$1.ports ]] || return
+  p=$(<"$CACHE/$1.ports")
+  [[ -n $p ]] && add r 3 "${#p}" "${ style green "$p"; }"
+}
+
+seg_jobs() { # $1 job count
+  (( ${1:-0} > 0 )) && add r 3 $(( ${#1} + 1 )) "${ style dim "⚙$1"; }"
+}
+
+# ---------- layout ----------
+
+render() { # $1 width
+  local width=$1 sep_w=3 i
+  local -a keep side pri w txt
+  for i in "${!SEGS[@]}"; do
+    IFS=$'\t' read -r side[i] pri[i] w[i] txt[i] <<<"${SEGS[i]}"
+    keep[i]=1
+  done
+  total() {
+    local t=4 nl=0 nr=0 j
+    for j in "${!SEGS[@]}"; do
+      (( keep[j] )) || continue
+      t=$(( t + w[j] ))
+      [[ ${side[j]} == l ]] && ((nl++)) || ((nr++))
+    done
+    (( nl > 1 )) && t=$(( t + (nl - 1) * sep_w ))
+    (( nr > 1 )) && t=$(( t + (nr - 1) * sep_w ))
+    echo "$t"
+  }
+  # Drop the lowest-priority segment until the line fits. Priority 1 always stays.
+  while (( ${ total; } > width )); do
+    local worst=-1 wp=1
+    for i in "${!SEGS[@]}"; do
+      (( keep[i] && pri[i] > wp )) && { worst=$i; wp=${pri[i]}; }
+    done
+    (( worst < 0 )) && break
+    keep[worst]=0
+  done
+
+  local sep; sep=${ style dim " · "; }
+  local left="" right="" lw=0 rw=0
+  for i in "${!SEGS[@]}"; do
+    (( keep[i] )) || continue
+    if [[ ${side[i]} == l ]]; then
+      [[ -n $left ]] && { left+=$sep; lw=$(( lw + sep_w )); }
+      left+=${txt[i]}; lw=$(( lw + w[i] ))
+    else
+      [[ -n $right ]] && { right+=$sep; rw=$(( rw + sep_w )); }
+      right+=${txt[i]}; rw=$(( rw + w[i] ))
+    fi
+  done
+
+  if [[ $MODE == tmux ]]; then
+    printf '#[bg=#16161e,fg=#c0caf5,fill=#16161e]  %s#[align=right]%s  ' "$left" "$right"
+  else
+    # Claude Code pads nothing for us, so we right-align the second half by hand.
+    local gap=$(( width - lw - rw - 4 )); (( gap < 2 )) && gap=2
+    printf '  %s%*s%s\n' "$left" "$gap" '' "$right"
+  fi
+}
+
+collect() { # $1 dir, $2 status, $3 ms, $4 jobs, $5 aws, $6 ssh, $7 PATH
+  local dir=$1 key
+  GIT_ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+  seg_danger "$5"
+  seg_remote "$6" "${HOSTNAME%%.*}"
+  seg_path "$dir" "$GIT_ROOT"
+  if [[ -n $GIT_ROOT ]]; then
+    key=${ key_for "$GIT_ROOT"; }
+    seg_git "$dir"
+    seg_drift "$GIT_ROOT"
+  fi
+  seg_last "$2" "$3"
+  if [[ -n $GIT_ROOT ]]; then
+    seg_ci "$key"
+    seg_toolchain "$GIT_ROOT" "$7"
+  fi
+  seg_agents
+  [[ -n $GIT_ROOT ]] && seg_ports "$key"
+  seg_jobs "$4"
+  [[ -n $GIT_ROOT ]] && maybe_refresh "$GIT_ROOT" "$key"
+}
+
+case $1 in
+  tmux|prompt)
+    # tmux mode draws the tmux status row. Prompt mode prints an ANSI line
+    # that the bash hook shows above the prompt when there is no tmux.
+    MODE=$1; [[ $MODE == prompt ]] && MODE=claude
+    pane=${2#%}; dir=$3; width=${4:-140}
+    st="" ms="" jobs=0 aws="" ssh="" path=$PATH
+    # The bash hook writes one file per pane: status, ms, jobs, AWS profile, SSH, PATH.
+    if [[ -r $STATE/pane/$pane ]]; then
+      { read -r st; read -r ms; read -r jobs; read -r aws; read -r ssh; read -r path; } < "$STATE/pane/$pane"
+    fi
+    collect "$dir" "$st" "$ms" "$jobs" "$aws" "$ssh" "$path"
+    render "$width"
+    ;;
+  claude)
+    MODE=claude
+    dir=$(jq -r '.workspace.current_dir // .cwd // empty' 2>/dev/null)
+    [[ -d $dir ]] || dir=$PWD
+    width=${COLUMNS:-$({ stty size </dev/tty; } 2>/dev/null | cut -d' ' -f2)}
+    collect "$dir" "" "" 0 "$AWS_PROFILE" "$SSH_CONNECTION" "$PATH"
+    render "${width:-140}"
+    ;;
+  refresh)
+    refresh "${2:-$PWD}"
+    ;;
+  agent)
+    sid=$(jq -r '.session_id // empty' 2>/dev/null)
+    [[ -n $sid ]] || exit 0
+    case $2 in
+      wait) : > "$STATE/agents/$sid" ;;
+      clear) rm -f "$STATE/agents/$sid" ;;
+    esac
+    ;;
+  *)
+    echo "usage: sonar tmux <pane_id> <dir> <width> | claude | refresh <dir> | agent wait|clear" >&2
+    exit 2
+    ;;
+esac
