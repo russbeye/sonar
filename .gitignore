@@ -1,0 +1,2 @@
+# Track ADP audit logs in this repo. The global git ignore excludes .adp/ elsewhere.
+!.adp/
