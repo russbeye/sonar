@@ -6,6 +6,7 @@
 #   sonar claude                               Claude Code statusLine (JSON on stdin)
 #   sonar refresh <dir>                        background CI and port lookups
 #   sonar agent wait|clear                     Claude Code hook (JSON on stdin)
+#   sonar ports [--kill-strays]                every listener, with orphans flagged
 #
 # The render path only reads files. Anything slow (gh, ss) runs in `refresh`,
 # which the render path starts in the background at most once per TTL, so a
@@ -46,14 +47,37 @@ refresh() {
     printf '%s\n' "$out" > "$CACHE/$key.ci"
   fi
 
-  # A port belongs to this repo when the listening process runs inside it.
-  local ports=() line pid port cwd
+  # A port belongs to this repo when the listening process runs inside it. The
+  # bar shows it only when it is fixed, that is outside the kernel ephemeral
+  # range, or when .sonar names it. At most 3 ports show, then +N.
+  local ports=() line pid port cwd lo hi
+  ephemeral_range; lo=$EPH_LO hi=$EPH_HI
+  sonar_names "$root"
   while read -r line; do
     port=${line%% *}; pid=${line#* }
     cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
-    [[ $cwd == "$root" || $cwd == "$root"/* ]] && ports+=(":$port")
+    [[ $cwd == "$root" || $cwd == "$root"/* ]] || continue
+    [[ -n ${NAMES[$port]} ]] || (( port < lo || port > hi )) || continue
+    ports+=("${NAMES[$port]}:$port")
   done < <(ss -Hltnp 2>/dev/null | sed -nE 's/^\S+\s+\S+\s+\S+\s+\S*:([0-9]+)\s.*pid=([0-9]+).*/\1 \2/p' | sort -un)
+  (( ${#ports[@]} > 3 )) && ports=("${ports[@]:0:3}" "+$(( ${#ports[@]} - 3 ))")
   printf '%s\n' "${ports[*]}" > "$CACHE/$key.ports"
+}
+
+ephemeral_range() { # sets EPH_LO and EPH_HI from the kernel, or the Linux default
+  EPH_LO=32768 EPH_HI=60999
+  { read -r EPH_LO EPH_HI < /proc/sys/net/ipv4/ip_local_port_range; } 2>/dev/null
+}
+
+# A .sonar file in the repo names ports, one name=port pair per line. A repo
+# can be a stranger's clone, so we only match the pattern and never source the file.
+sonar_names() { # $1 repo root; fills the NAMES map from port to name
+  local line
+  declare -gA NAMES=()
+  [[ -r $1/.sonar ]] || return
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^([A-Za-z0-9_-]+)=([0-9]+)$ ]] && NAMES[${BASH_REMATCH[2]}]=${BASH_REMATCH[1]}
+  done < "$1/.sonar"
 }
 
 maybe_refresh() { # $1 dir, $2 cache key
@@ -66,11 +90,13 @@ maybe_refresh() { # $1 dir, $2 cache key
 }
 
 # ---------- segment collection ----------
-# Each segment is "side<TAB>priority<TAB>width<TAB>styled text". Priority 1 is
-# never dropped. Higher numbers drop first when the line is too wide.
+# Each segment is "side<TAB>priority", then one "width<TAB>styled text" pair
+# per form, longest form first. When the line is too wide, render moves
+# segments to shorter forms first and drops them only after that. Priority 1
+# is never dropped. Higher numbers shorten and drop first.
 
 SEGS=()
-add() { SEGS+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"); }
+add() { local IFS=$'\t'; SEGS+=("$*"); } # side priority width text [width text]...
 
 # Style helpers. tmux uses #[...] markup, Claude Code uses ANSI escapes.
 # Colors are the Tokyo Night values from the Sonar pitch.
@@ -108,7 +134,31 @@ seg_remote() { # $1 SSH_CONNECTION, $2 host
   [[ -n $1 ]] && add l 1 $(( ${#2} + 2 )) "${ style violet "⇄ $2"; }"
 }
 
+# Inside a repo the path starts at the repo. It shortens from repo/sub/dir to
+# repo/…/dir and then to repo. A linked worktree shows the main repo's name and ⧉. Its folder
+# shows too, unless the folder is named after the branch, so the bar does not
+# print the same words twice.
+seg_repo_path() { # uses GIT_ROOT, GIT_COMMON, GIT_PREFIX and GIT_BRANCH
+  local name=${GIT_ROOT##*/} mark="" folder="" rel=${GIT_PREFIX%/} head plain main forms=()
+  if [[ $GIT_COMMON != "$GIT_ROOT/.git" ]]; then
+    main=${GIT_COMMON%/}; main=${main%/.git}
+    folder=$name; name=${main##*/}; name=${name%.git}; mark=" ⧉"
+    [[ $folder == "$GIT_BRANCH" || $folder == "${GIT_BRANCH//\//-}" || $folder == "${GIT_BRANCH##*/}" ]] && folder=""
+  fi
+  head=${ style blue "${ style bold "$name"; }"; }
+  [[ -n $mark ]] && head+=${ style dim "$mark"; }
+  [[ -n $folder ]] && head+=${ style dim " $folder"; }
+  plain="$name$mark${folder:+ $folder}"
+  if [[ -n $rel ]]; then
+    forms+=( $(( ${#plain} + 1 + ${#rel} )) "$head${ style dim "/$rel"; }" )
+    local leaf=${rel##*/}
+    [[ $rel == */* ]] && forms+=( $(( ${#plain} + 3 + ${#leaf} )) "$head${ style dim "/…/$leaf"; }" )
+  fi
+  add l 1 "${forms[@]}" "${#plain}" "$head"
+}
+
 seg_path() { # $1 dir, $2 repo root or empty
+  [[ -n $2 ]] && { seg_repo_path; return; }
   local d=$1 home=$HOME rel parent leaf out=""
   [[ $d == "$home" || $d == "$home"/* ]] && d="~${d#"$home"}"
   leaf=${d##*/}; parent=${d%/*}
@@ -123,14 +173,12 @@ seg_path() { # $1 dir, $2 repo root or empty
   [[ $parent == /* ]] && out="/$out"
   [[ -z $parent && $d == /* && $d != / ]] && out="/"
   local w=$(( ${#out} + ${#leaf} ))
-  if [[ -n $2 && $1 == "$2" ]]; then
-    add l 1 "$w" "${ style dim "$out"; }${ style blue "${ style bold "$leaf"; }"; }"
-  else
-    add l 1 "$w" "${ style dim "$out"; }${ style blue "$leaf"; }"
-  fi
+  add l 1 "$w" "${ style dim "$out"; }${ style blue "$leaf"; }"
 }
 
-seg_git() { # $1 dir; sets GIT_DIRTY and GIT_ROOT
+# The path segment needs the branch name, so we read git status before any
+# segment is added and keep the results in GIT_* globals.
+git_read() { # $1 dir; sets GIT_BRANCH, GIT_DIRTY and the GIT_* counts
   local line branch="" ahead=0 behind=0 staged=0 modified=0 untracked=0 conflicted=0
   GIT_DIRTY=0
   while IFS= read -r line; do
@@ -147,16 +195,43 @@ seg_git() { # $1 dir; sets GIT_DIRTY and GIT_ROOT
   done < <(git -C "$1" status --porcelain=v2 -b 2>/dev/null)
   [[ $branch == "(detached)" ]] && branch=${oid:0:7}
   (( staged + modified + untracked + conflicted )) && GIT_DIRTY=1
+  GIT_BRANCH=$branch GIT_AHEAD=$ahead GIT_BEHIND=$behind GIT_STAGED=$staged
+  GIT_MODIFIED=$modified GIT_UNTRACKED=$untracked GIT_CONFLICTED=$conflicted
+}
 
-  local txt w
-  txt=${ style cyan "⎇ $branch"; }; w=$(( ${#branch} + 2 ))
-  (( ahead ))      && { txt+=" ${ style green "⇡$ahead"; }";       w=$(( w + 2 + ${#ahead} )); }
-  (( behind ))     && { txt+=" ${ style red "⇣$behind"; }";        w=$(( w + 2 + ${#behind} )); }
-  (( conflicted )) && { txt+=" ${ style red "!$conflicted"; }";    w=$(( w + 2 + ${#conflicted} )); }
-  (( staged ))     && { txt+=" ${ style green "+$staged"; }";      w=$(( w + 2 + ${#staged} )); }
-  (( modified ))   && { txt+=" ${ style amber "●$modified"; }";    w=$(( w + 2 + ${#modified} )); }
-  (( untracked ))  && { txt+=" ${ style dim "?$untracked"; }";     w=$(( w + 2 + ${#untracked} )); }
-  add l 1 "$w" "$txt"
+# Shorter forms of a branch name, longest first, in BRANCH_FORMS. A long name
+# loses its middle first. Then it keeps the type and the ticket number, or the
+# type and the last word. We keep a form only when it is shorter than the one
+# before it, so a short name never turns into a bare ellipsis.
+branch_forms() { # $1 branch
+  local b=$1 prev=$1 h t type rest f
+  BRANCH_FORMS=()
+  if (( ${#b} > 28 )); then
+    h=${b:0:14}; h=${h%[-_/]}; t=${b: -13}; t=${t#[-_/]}
+    BRANCH_FORMS+=("$h…$t"); prev="$h…$t"
+  fi
+  [[ $b == */* ]] || return
+  type=${b%%/*}; rest=${b#*/}
+  # A ticket number is a group of digits that stands alone between separators,
+  # so "aromatica-017-add" has one and "oauth2-login" does not.
+  if [[ $rest =~ (^|[-_])([0-9]+)([-_]|$) ]]; then f="$type/${BASH_REMATCH[2]}…"
+  else f="$type/…${rest##*[-_]}"; fi
+  (( ${#f} < ${#prev} )) && BRANCH_FORMS+=("$f")
+}
+
+seg_git() { # uses the GIT_* values from git_read
+  local tail="" tw=0 b forms=()
+  (( GIT_AHEAD ))      && { tail+=" ${ style green "⇡$GIT_AHEAD"; }";       tw=$(( tw + 2 + ${#GIT_AHEAD} )); }
+  (( GIT_BEHIND ))     && { tail+=" ${ style red "⇣$GIT_BEHIND"; }";        tw=$(( tw + 2 + ${#GIT_BEHIND} )); }
+  (( GIT_CONFLICTED )) && { tail+=" ${ style red "!$GIT_CONFLICTED"; }";    tw=$(( tw + 2 + ${#GIT_CONFLICTED} )); }
+  (( GIT_STAGED ))     && { tail+=" ${ style green "+$GIT_STAGED"; }";      tw=$(( tw + 2 + ${#GIT_STAGED} )); }
+  (( GIT_MODIFIED ))   && { tail+=" ${ style amber "●$GIT_MODIFIED"; }";    tw=$(( tw + 2 + ${#GIT_MODIFIED} )); }
+  (( GIT_UNTRACKED ))  && { tail+=" ${ style dim "?$GIT_UNTRACKED"; }";     tw=$(( tw + 2 + ${#GIT_UNTRACKED} )); }
+  branch_forms "$GIT_BRANCH"
+  for b in "$GIT_BRANCH" "${BRANCH_FORMS[@]}"; do
+    forms+=( $(( ${#b} + 2 + tw )) "${ style cyan "⎇ $b"; }$tail" )
+  done
+  add l 1 "${forms[@]}"
 }
 
 seg_drift() { # $1 repo root. Only shown while the tree is dirty.
@@ -173,7 +248,8 @@ seg_drift() { # $1 repo root. Only shown while the tree is dirty.
   if (( mins < 60 )); then txt="${mins}m"
   elif (( mins < 1440 )); then printf -v txt '%dh%02d' $(( mins / 60 )) $(( mins % 60 ))
   else txt="$(( mins / 1440 ))d"; fi
-  add l 4 $(( ${#txt} + 2 )) "${ style "$col" "$glyph $txt"; }"
+  # In a narrow pane the dial alone still says how old the work is.
+  add l 4 $(( ${#txt} + 2 )) "${ style "$col" "$glyph $txt"; }" 1 "${ style "$col" "$glyph"; }"
 }
 
 seg_last() { # $1 exit status, $2 duration in ms
@@ -240,7 +316,8 @@ seg_agents() {
     # A session that crashed without clearing its file stops counting after 12 hours.
     (( ${ mtime_age "$f"; } < 43200 )) && ((n++))
   done
-  (( n )) && add r 2 $(( ${#n} + 10 )) "${ style violet "✦ $n waiting"; }"
+  (( n )) && add r 2 $(( ${#n} + 10 )) "${ style violet "✦ $n waiting"; }" \
+                   $(( ${#n} + 1 )) "${ style violet "✦$n"; }"
 }
 
 seg_ports() { # $1 cache key
@@ -257,24 +334,39 @@ seg_jobs() { # $1 job count
 # ---------- layout ----------
 
 render() { # $1 width
-  local width=$1 sep_w=3 i
-  local -a keep side pri w txt
+  local width=$1 sep_w=3 i k
+  local -a keep side pri lvl nf f
+  local -A fw ft # width and text of form k of segment i, keyed "i,k"
   for i in "${!SEGS[@]}"; do
-    IFS=$'\t' read -r side[i] pri[i] w[i] txt[i] <<<"${SEGS[i]}"
-    keep[i]=1
+    IFS=$'\t' read -ra f <<<"${SEGS[i]}"
+    side[i]=${f[0]}; pri[i]=${f[1]}; keep[i]=1; lvl[i]=0
+    nf[i]=$(( (${#f[@]} - 2) / 2 ))
+    for (( k = 0; k < nf[i]; k++ )); do
+      fw[$i,$k]=${f[2 + 2 * k]}; ft[$i,$k]=${f[3 + 2 * k]}
+    done
   done
   total() {
     local t=4 nl=0 nr=0 j
     for j in "${!SEGS[@]}"; do
       (( keep[j] )) || continue
-      t=$(( t + w[j] ))
+      t=$(( t + fw[$j,${lvl[j]}] ))
       [[ ${side[j]} == l ]] && ((nl++)) || ((nr++))
     done
     (( nl > 1 )) && t=$(( t + (nl - 1) * sep_w ))
     (( nr > 1 )) && t=$(( t + (nr - 1) * sep_w ))
     echo "$t"
   }
-  # Drop the lowest-priority segment until the line fits. Priority 1 always stays.
+  # Shorten first, one step at a time, starting with the lowest-priority
+  # segment that still has a shorter form. This is the order the pitch mockup uses.
+  while (( ${ total; } > width )); do
+    local pick=-1 pp=0
+    for i in "${!SEGS[@]}"; do
+      (( keep[i] && lvl[i] < nf[i] - 1 && pri[i] > pp )) && { pick=$i; pp=${pri[i]}; }
+    done
+    (( pick < 0 )) && break
+    lvl[pick]=$(( lvl[pick] + 1 ))
+  done
+  # Then drop the lowest-priority segment until the line fits. Priority 1 always stays.
   while (( ${ total; } > width )); do
     local worst=-1 wp=1
     for i in "${!SEGS[@]}"; do
@@ -288,12 +380,13 @@ render() { # $1 width
   local left="" right="" lw=0 rw=0
   for i in "${!SEGS[@]}"; do
     (( keep[i] )) || continue
+    k=$i,${lvl[i]}
     if [[ ${side[i]} == l ]]; then
       [[ -n $left ]] && { left+=$sep; lw=$(( lw + sep_w )); }
-      left+=${txt[i]}; lw=$(( lw + w[i] ))
+      left+=${ft[$k]}; lw=$(( lw + fw[$k] ))
     else
       [[ -n $right ]] && { right+=$sep; rw=$(( rw + sep_w )); }
-      right+=${txt[i]}; rw=$(( rw + w[i] ))
+      right+=${ft[$k]}; rw=$(( rw + fw[$k] ))
     fi
   done
 
@@ -308,13 +401,18 @@ render() { # $1 width
 
 collect() { # $1 dir, $2 status, $3 ms, $4 jobs, $5 aws, $6 ssh, $7 PATH
   local dir=$1 key
-  GIT_ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+  GIT_ROOT="" GIT_COMMON="" GIT_PREFIX=""
+  # One git call gives the root, the shared .git of a worktree, and the subdirectory.
+  # We ask for absolute paths because in a main checkout --git-common-dir is otherwise just ".git".
+  { read -r GIT_ROOT; read -r GIT_COMMON; read -r GIT_PREFIX; } < <(git -C "$dir" rev-parse \
+      --path-format=absolute --show-toplevel --git-common-dir --show-prefix 2>/dev/null)
+  [[ -n $GIT_ROOT ]] && git_read "$dir"
   seg_danger "$5"
   seg_remote "$6" "${HOSTNAME%%.*}"
   seg_path "$dir" "$GIT_ROOT"
   if [[ -n $GIT_ROOT ]]; then
     key=${ key_for "$GIT_ROOT"; }
-    seg_git "$dir"
+    seg_git
     seg_drift "$GIT_ROOT"
   fi
   seg_last "$2" "$3"
@@ -328,7 +426,118 @@ collect() { # $1 dir, $2 status, $3 ms, $4 jobs, $5 aws, $6 ssh, $7 PATH
   [[ -n $GIT_ROOT ]] && maybe_refresh "$GIT_ROOT" "$key"
 }
 
+# ---------- sonar ports ----------
+# Lists every listener on the machine, not only the ones on the bar. Nothing
+# here runs on the render path, so it can afford to read /proc for each process.
+
+proc_info() { # $1 pid; sets P_PPID, P_START (clock ticks since boot), P_CMD, P_NAME and P_CWD
+  local s a args=()
+  P_PPID="" P_START="" P_CMD="" P_NAME="-" P_CWD=""
+  { s=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  # The command name in field 2 can hold spaces, so we split after its closing paren.
+  read -ra a <<<"${s##*) }"
+  P_PPID=${a[1]} P_START=${a[19]}
+  mapfile -d '' args < "/proc/$1/cmdline" 2>/dev/null
+  P_CMD="${args[*]}"
+  P_CWD=$(readlink "/proc/$1/cwd" 2>/dev/null)
+  { P_NAME=$(<"/proc/$1/comm"); } 2>/dev/null
+  # For a script run by an interpreter, the script name says more than "node".
+  case ${args[0]##*/} in
+    node|bun|deno|python*|ruby|perl)
+      local x
+      for x in "${args[@]:1}"; do
+        [[ $x == -* ]] && continue
+        x=${x##*/}; P_NAME=${x%.*}; break
+      done ;;
+  esac
+}
+
+# An orphan is a listener whose parent is gone, so PID 1 or the systemd user
+# manager, which adopts orphaned user processes, is now its parent.
+is_orphan() { # $1 parent pid
+  [[ $1 == 1 ]] && return 0
+  local args=()
+  mapfile -d '' args < "/proc/$1/cmdline" 2>/dev/null
+  [[ ${args[0]##*/} == systemd && " ${args[*]:1} " == *" --user "* ]]
+}
+
+fmt_age() { # $1 seconds
+  local m=$(( $1 / 60 ))
+  if (( m < 60 )); then echo "${m}m"
+  elif (( m < 1440 )); then printf '%dh%02d\n' $(( m / 60 )) $(( m % 60 ))
+  else echo "$(( m / 1440 ))d"; fi
+}
+
+# Asks before each kill and defaults to No, because a detached server that
+# someone wants, such as a viewer started on purpose, also looks like an orphan.
+# The answer comes from stdin, so the caller connects it to the terminal.
+confirm_kill() { # $1 pid, $2 start ticks seen in the listing, $3 port, $4 age, $5 cwd, $6 command
+  local ans=""
+  printf 'kill %s (:%s, up %s, in %s)?\n  %s\n[y/N] ' "$1" "$3" "$4" "$5" "$6"
+  read -r ans || ans=""
+  [[ $ans == [yY] ]] || { echo "kept $1"; return; }
+  # A PID can be reused after exit. The start time tells the old process from a new one.
+  proc_info "$1" && [[ $P_START == "$2" ]] || { echo "$1 already gone"; return; }
+  kill -TERM "$1" && echo "sent SIGTERM to $1"
+}
+
+ports_cmd() { # $1 dir, $2 --kill-strays or empty
+  local root lo hi up tck state rq sq local_ peer rest port pid i j
+  local -a rows_port rows_pid
+  local -A seen name start ppid cmd cwd age
+  root=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)
+  ephemeral_range; lo=$EPH_LO hi=$EPH_HI
+  declare -gA NAMES=(); [[ -n $root ]] && sonar_names "$root"
+  read -r up _ < /proc/uptime; up=${up%.*}; tck=$(getconf CLK_TCK)
+  while read -r state rq sq local_ peer rest; do
+    port=${local_##*:}; pid=-
+    [[ $rest =~ pid=([0-9]+) ]] && pid=${BASH_REMATCH[1]}
+    [[ -n ${seen[$port,$pid]} ]] && continue # one row per port and PID, not per address
+    seen[$port,$pid]=1
+    rows_port+=("$port"); rows_pid+=("$pid")
+    [[ $pid == - || -n ${cmd[$pid]+x} ]] && continue
+    proc_info "$pid" || continue
+    name[$pid]=$P_NAME start[$pid]=$P_START ppid[$pid]=$P_PPID cmd[$pid]=$P_CMD cwd[$pid]=$P_CWD
+    age[$pid]=${ fmt_age $(( up - P_START / tck )); }
+  done < <(ss -Hltnp 2>/dev/null)
+
+  local -a orphans=()
+  printf '%-7s %-8s %-12s %-5s %-4s %s\n' PORT PID NAME AGE BAR NOTE
+  for i in ${ for j in "${!rows_port[@]}"; do echo "${rows_port[j]} $j"; done | sort -n | cut -d' ' -f2; }; do
+    port=${rows_port[i]} pid=${rows_pid[i]}
+    local nm=${NAMES[$port]:-${name[$pid]:--}} bar=no note="" p
+    if [[ -n $root && $pid != - && ( ${cwd[$pid]} == "$root" || ${cwd[$pid]} == "$root"/* ) ]] \
+       && { [[ -n ${NAMES[$port]} ]] || (( port < lo || port > hi )); }; then bar=yes; fi
+    if [[ $pid != - && -n ${cmd[$pid]+x} ]]; then
+      p=${ppid[$pid]}
+      if [[ -n ${cmd[$p]+x} ]]; then note="child of ${name[$p]} $p"
+      elif is_orphan "$p"; then note=orphan; orphans+=("$pid")
+      fi
+      # A duplicate runs the same command in the same folder as another listener.
+      for j in "${!cmd[@]}"; do
+        [[ $j != "$pid" && ${cmd[$j]} == "${cmd[$pid]}" && ${cwd[$j]} == "${cwd[$pid]}" ]] && { note+="${note:+, }duplicate of $j"; break; }
+      done
+    fi
+    printf '%-7s %-8s %-12s %-5s %-4s %s\n' ":$port" "$pid" "$nm" "${age[$pid]:--}" "$bar" "$note"
+  done
+
+  [[ $2 == --kill-strays ]] || return 0
+  (( ${#orphans[@]} )) || { echo "no orphans"; return 0; }
+  for pid in ${ printf '%s\n' "${orphans[@]}" | sort -un; }; do
+    port=""
+    for i in "${!rows_pid[@]}"; do [[ ${rows_pid[i]} == "$pid" ]] && port+="${port:+,}${rows_port[i]}"; done
+    confirm_kill "$pid" "${start[$pid]}" "$port" "${age[$pid]}" "${cwd[$pid]}" "${cmd[$pid]}" < /dev/tty
+  done
+}
+
+# Tests source this file to call its functions, so the dispatch runs only
+# when sonar runs as a program.
+[[ ${BASH_SOURCE[0]} != "$0" ]] && return 0
+
 case $1 in
+  ports)
+    ports_cmd "$PWD" "$2"
+    ;;
   tmux|prompt)
     # tmux mode draws the tmux status row. Prompt mode prints an ANSI line
     # that the bash hook shows above the prompt when there is no tmux.
@@ -362,7 +571,7 @@ case $1 in
     esac
     ;;
   *)
-    echo "usage: sonar tmux <pane_id> <dir> <width> | claude | refresh <dir> | agent wait|clear" >&2
+    echo "usage: sonar tmux <pane_id> <dir> <width> | claude | refresh <dir> | agent wait|clear | ports [--kill-strays]" >&2
     exit 2
     ;;
 esac
