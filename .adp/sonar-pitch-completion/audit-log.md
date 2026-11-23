@@ -363,3 +363,23 @@ The Test Adversary Document lists 9 gaps. Reviewers need to know these four firs
 - **Assumptions:** none
 - **Created:** 2026-11-22, Phase 7
 - **Status:** VALIDATED
+
+## Deployment Risk Statement
+**Known unknowns at ship time:** The change went live while it was written. `~/.local/bin/sonar` is a symlink into this repo, so tmux, the bash hook, and Claude Code ran each saved version of `bin/sonar` from the first Phase 5 edit on. The OPEN Decision Log entries at ship time are DL-005, DL-006, DL-010, DL-011, DL-017, and DL-019. Each one waits for real branches, worktree tools, dev servers, tmux restarts, or folder names to confirm or disprove it.
+**Monitoring targets:**
+| Assumption | Signal that it was wrong | Threshold | dl_ref |
+|------------|--------------------------|-----------|--------|
+| Ticket numbers in branch names stand between separators. | A narrow bar shows `type/NNN…` where NNN is not a ticket number. A version number in a branch name, such as `bump-node-22`, looks the same. | Any occurrence the developer notices | DL-005 |
+| Worktree folders match their branch in one of three ways. | A worktree bar shows a folder name that repeats the branch name. A folder that shares only a prefix with the branch looks similar, but it is a different name and shows correctly. | Any occurrence | DL-006 |
+| Interpreters take the script as their first non-option argument. | The NAME column shows an option value or a folder name for an interpreter process. A script that really carries that name looks the same. | Any occurrence | DL-010 |
+| The orphan rule plus the y/N question for each process keeps wanted servers alive. | → Pre-Mortem: "PM-1: `sonar ports --kill-strays` kills a server that the developer wants running, for example the ADP mission control server." The count of processes that `--kill-strays` terminates without a `y` typed for that PID. A process that exits by itself shows "already gone" and does not count. | Count above 0 | DL-011 |
+| The tmux server starts with a UTF-8 locale. | The tmux status row wraps or cuts its right side in a pane where `sonar prompt` fits. A pane narrower than the shortest priority 1 forms looks the same, and it overflows in every mode. | Any occurrence | DL-017 |
+| No folder name holds `#[`. | The tmux row shows colors or alignment that no segment sets, in a folder whose name holds `#`. The danger segment sets a red background on purpose and looks similar. | Any occurrence | DL-019 |
+**Rollback trigger conditions:**
+- [ ] If `--kill-strays` terminates any process without a typed `y`, roll back `bin/sonar` → rollback
+- [ ] If a prompt or tmux render writes anything to stderr, roll back `bin/sonar` → rollback
+- [ ] If the interleaved A/B median render exceeds the `c944908` median by 3 ms, roll back → rollback
+- [ ] If the tmux status row goes blank or prints raw widths or tabs, roll back → rollback
+
+Rollback is one command, `git -C ~/Projects/sonar checkout c944908 -- bin/sonar`, and it takes effect at the next prompt or tmux status refresh. The `refresh` cache needs no rollback, because the old code reads the new `.ports` text as plain words, and `PORT_TTL` rewrites the file within 15 s.
+**Staged rollout:** NO — Sonar has one user on one host (CD5), the change is already live through the symlink, and the rollback above takes effect within one status refresh. A staged rollout has no second audience to stage to.
